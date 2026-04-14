@@ -6,3 +6,4 @@ Pillow==10.4.0
 bcrypt==4.2.0
 python-dotenv==1.0.1
 tf-keras==2.18.0
+ultralytics>=8.3.0

@@ -1,31 +1,113 @@
+"""
+Détection et reconnaissance faciale.
+
+Priorité :
+  1. Modèle YOLO entraîné (models/face_yolo.pt) — détection + identification en 1 passe
+  2. Fallback DeepFace/ArcFace — si le modèle YOLO n'existe pas encore
+"""
+
+import os
 import cv2
 import numpy as np
-import tempfile
-import os
-from deepface import DeepFace
+from pathlib import Path
 
-MODEL_NAME = os.getenv("DEEPFACE_MODEL", "ArcFace")
-DETECTOR = os.getenv("DEEPFACE_DETECTOR", "opencv")
-DISTANCE_METRIC = "cosine"
-THRESHOLD = float(os.getenv("RECOGNITION_THRESHOLD", "0.68"))
-DB_PATH_FACES = os.getenv("FACES_DB_PATH", "data/faces")
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "models/face_yolo.pt")
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 
+# Fallback DeepFace
+DEEPFACE_MODEL = os.getenv("DEEPFACE_MODEL", "ArcFace")
+DEEPFACE_DETECTOR = os.getenv("DEEPFACE_DETECTOR", "opencv")
+FACES_DB_PATH = os.getenv("FACES_DB_PATH", "data/faces")
+RECOGNITION_THRESHOLD = float(os.getenv("RECOGNITION_THRESHOLD", "0.68"))
 
-def build_face_db_if_needed():
-    """Pré-calcule les embeddings du dossier faces/ au démarrage."""
-    if not os.path.exists(FACES_DB_PATH):
-        os.makedirs(FACES_DB_PATH, exist_ok=True)
+_yolo_model = None
+_use_yolo = False
 
 
-def recognize_face(face_img: np.ndarray) -> dict:
+def _load_yolo():
+    global _yolo_model, _use_yolo
+    if Path(YOLO_MODEL_PATH).exists():
+        from ultralytics import YOLO
+        _yolo_model = YOLO(YOLO_MODEL_PATH)
+        _use_yolo = True
+        print(f"✅ Modèle YOLO chargé : {YOLO_MODEL_PATH}")
+    else:
+        _use_yolo = False
+        print(f"⚠️  Modèle YOLO non trouvé ({YOLO_MODEL_PATH}). Fallback DeepFace.")
+
+
+_load_yolo()
+
+
+# ── YOLO pipeline ─────────────────────────────────────────────────────────────
+
+def _detect_and_recognize_yolo(frame: np.ndarray) -> list[dict]:
     """
-    Identifie un visage extrait (numpy array BGR).
-    Retourne {"identity": str, "confidence": float, "verified": bool}.
+    Passe YOLO unique : détecte ET identifie chaque visage.
+    Retourne une liste de résultats avec bbox + identité + confiance.
     """
+    results = _yolo_model.predict(
+        source=frame,
+        conf=CONFIDENCE_THRESHOLD,
+        verbose=False,
+    )[0]
+
+    detections = []
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        conf = float(box.conf[0])
+        cls_id = int(box.cls[0])
+        identity = results.names[cls_id]
+
+        detections.append({
+            "bbox": (x1, y1, x2 - x1, y2 - y1),
+            "identity": identity,
+            "confidence": round(conf * 100, 1),
+            "verified": conf >= CONFIDENCE_THRESHOLD,
+        })
+    return detections
+
+
+# ── DeepFace fallback ─────────────────────────────────────────────────────────
+
+def _detect_and_recognize_deepface(frame: np.ndarray) -> list[dict]:
+    """Fallback DeepFace : détection + embeddings ArcFace."""
+    try:
+        from deepface import DeepFace
+        import tempfile
+
+        faces_info = DeepFace.extract_faces(
+            img_path=frame,
+            detector_backend=DEEPFACE_DETECTOR,
+            enforce_detection=False,
+        )
+    except Exception:
+        return []
+
+    detections = []
+    for f in faces_info:
+        region = f["facial_area"]
+        x, y, w, h = region["x"], region["y"], region["w"], region["h"]
+        face_img = frame[y: y + h, x: x + w]
+
+        result = _recognize_deepface(face_img)
+        detections.append({
+            "bbox": (x, y, w, h),
+            "identity": result["identity"],
+            "confidence": result["confidence"],
+            "verified": result["verified"],
+        })
+    return detections
+
+
+def _recognize_deepface(face_img: np.ndarray) -> dict:
+    from deepface import DeepFace
+    import tempfile
+
     if face_img is None or face_img.size == 0:
         return {"identity": "Inconnu", "confidence": 0.0, "verified": False}
 
-    if not os.path.exists(DB_PATH_FACES) or not os.listdir(DB_PATH_FACES):
+    if not os.path.exists(FACES_DB_PATH) or not os.listdir(FACES_DB_PATH):
         return {"identity": "Base vide", "confidence": 0.0, "verified": False}
 
     try:
@@ -35,10 +117,10 @@ def recognize_face(face_img: np.ndarray) -> dict:
 
         results = DeepFace.find(
             img_path=tmp_path,
-            db_path=DB_PATH_FACES,
-            model_name=MODEL_NAME,
-            detector_backend=DETECTOR,
-            distance_metric=DISTANCE_METRIC,
+            db_path=FACES_DB_PATH,
+            model_name=DEEPFACE_MODEL,
+            detector_backend=DEEPFACE_DETECTOR,
+            distance_metric="cosine",
             enforce_detection=False,
             silent=True,
         )
@@ -46,10 +128,10 @@ def recognize_face(face_img: np.ndarray) -> dict:
 
         if results and len(results[0]) > 0:
             top = results[0].iloc[0]
-            distance = top[f"{MODEL_NAME}_{DISTANCE_METRIC}"]
+            distance = top[f"{DEEPFACE_MODEL}_cosine"]
             confidence = round((1 - distance) * 100, 1)
             identity = os.path.splitext(os.path.basename(top["identity"]))[0]
-            verified = distance < THRESHOLD
+            verified = distance < RECOGNITION_THRESHOLD
             return {"identity": identity, "confidence": confidence, "verified": verified}
 
     except Exception:
@@ -58,43 +140,49 @@ def recognize_face(face_img: np.ndarray) -> dict:
     return {"identity": "Inconnu", "confidence": 0.0, "verified": False}
 
 
-def detect_faces(frame: np.ndarray) -> list[dict]:
+# ── Interface publique ────────────────────────────────────────────────────────
+
+def detect_and_recognize(frame: np.ndarray) -> list[dict]:
     """
-    Détecte tous les visages dans une frame.
-    Retourne une liste de {"bbox": (x,y,w,h), "face_img": np.ndarray}.
+    Détecte et identifie tous les visages dans une frame.
+
+    Retourne une liste de :
+        {
+            "bbox":       (x, y, w, h),
+            "identity":   str,
+            "confidence": float,   # 0–100
+            "verified":   bool,
+        }
     """
-    try:
-        faces = DeepFace.extract_faces(
-            img_path=frame,
-            detector_backend=DETECTOR,
-            enforce_detection=False,
+    if _use_yolo:
+        return _detect_and_recognize_yolo(frame)
+    return _detect_and_recognize_deepface(frame)
+
+
+def draw_results(frame: np.ndarray, detections: list[dict]) -> np.ndarray:
+    """Dessine les bounding boxes et labels sur la frame."""
+    for det in detections:
+        x, y, w, h = det["bbox"]
+        verified = det["verified"]
+        color = (0, 200, 0) if verified else (0, 0, 220)
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+        label = det["identity"].replace("_", " ")
+        if verified:
+            label += f"  {det['confidence']}%"
+
+        # Fond du label
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (x, y - th - 10), (x + tw + 4, y), color, -1)
+        cv2.putText(
+            frame, label,
+            (x + 2, y - 4),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
         )
-        result = []
-        for f in faces:
-            region = f["facial_area"]
-            x, y, w, h = region["x"], region["y"], region["w"], region["h"]
-            face_img = frame[y : y + h, x : x + w]
-            result.append({"bbox": (x, y, w, h), "face_img": face_img})
-        return result
-    except Exception:
-        return []
 
-
-def draw_result(frame: np.ndarray, bbox: tuple, result: dict) -> np.ndarray:
-    """Dessine le rectangle et le label sur la frame."""
-    x, y, w, h = bbox
-    verified = result.get("verified", False)
-    color = (0, 200, 0) if verified else (0, 0, 220)
-
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-
-    label = result["identity"]
-    if verified:
-        label += f"  {result['confidence']}%"
-
-    cv2.putText(
-        frame, label,
-        (x, y - 10),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
-    )
     return frame
+
+
+def using_yolo() -> bool:
+    return _use_yolo

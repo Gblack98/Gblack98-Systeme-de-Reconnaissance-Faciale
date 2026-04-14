@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.database import init_db, register_user, authenticate_user, log_recognition
-from app.recognition import detect_faces, recognize_face, draw_result, DB_PATH_FACES
+from app.recognition import detect_and_recognize, draw_results, using_yolo, FACES_DB_PATH
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -117,25 +117,23 @@ def recognition_page(user):
 
 
 def process_frame_and_display(frame, user):
-    faces = detect_faces(frame)
-    if not faces:
+    detections = detect_and_recognize(frame)
+    if not detections:
         st.warning("Aucun visage détecté.")
         st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
         return
 
-    for face in faces:
-        result = recognize_face(face["face_img"])
-        frame = draw_result(frame, face["bbox"], result)
-        if result["verified"]:
-            log_recognition(user["id"], result["identity"], result["confidence"])
+    for det in detections:
+        if det["verified"]:
+            log_recognition(user["id"], det["identity"], det["confidence"])
 
-    st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+    annotated = draw_results(frame.copy(), detections)
+    st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
 
     st.subheader("Résultats")
-    for face in faces:
-        result = recognize_face(face["face_img"])
-        status = "✅ Identifié" if result["verified"] else "❓ Inconnu"
-        st.write(f"{status} — **{result['identity']}** ({result['confidence']}%)")
+    for det in detections:
+        status = "✅ Identifié" if det["verified"] else "❓ Inconnu"
+        st.write(f"{status} — **{det['identity']}** ({det['confidence']}%)")
 
 
 def run_webcam(user):
@@ -146,12 +144,11 @@ def run_webcam(user):
             ret, frame = cap.read()
             if not ret:
                 break
-            faces = detect_faces(frame)
-            for face in faces:
-                result = recognize_face(face["face_img"])
-                frame = draw_result(frame, face["bbox"], result)
-                if result["verified"]:
-                    log_recognition(user["id"], result["identity"], result["confidence"])
+            detections = detect_and_recognize(frame)
+            for det in detections:
+                if det["verified"]:
+                    log_recognition(user["id"], det["identity"], det["confidence"])
+            draw_results(frame, detections)
             cv2.imshow("Reconnaissance Faciale — Q pour quitter", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
@@ -172,10 +169,8 @@ def run_video(uploaded, user):
         ret, frame = cap.read()
         if not ret:
             break
-        faces = detect_faces(frame)
-        for face in faces:
-            result = recognize_face(face["face_img"])
-            frame = draw_result(frame, face["bbox"], result)
+        detections = detect_and_recognize(frame)
+        draw_results(frame, detections)
         stframe.image(
             cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True
         )
@@ -202,12 +197,12 @@ def add_face_page():
         if not name or not photo:
             st.error("Veuillez remplir tous les champs.")
         else:
-            os.makedirs(DB_PATH_FACES, exist_ok=True)
-            dest = os.path.join(DB_PATH_FACES, f"{name}.jpg")
+            os.makedirs(FACES_DB_PATH, exist_ok=True)
+            dest = os.path.join(FACES_DB_PATH, f"{name}.jpg")
             img = Image.open(photo).convert("RGB")
             img.save(dest)
             # Supprimer le cache DeepFace pour forcer le recalcul des embeddings
-            pkl_path = os.path.join(DB_PATH_FACES, "representations_arcface.pkl")
+            pkl_path = os.path.join(FACES_DB_PATH, "representations_arcface.pkl")
             if os.path.exists(pkl_path):
                 os.remove(pkl_path)
             st.success(f"✅ **{name}** ajouté à la base. Il sera reconnu lors du prochain scan.")
@@ -217,7 +212,9 @@ def add_face_page():
 # ── About page ────────────────────────────────────────────────────────────────
 def about_page():
     st.header("ℹ️ À propos du projet")
-    st.markdown("""
+    from app.recognition import using_yolo
+    backend = "YOLOv8 (détection + identification en 1 passe)" if using_yolo() else "DeepFace / ArcFace (fallback)"
+    st.markdown(f"""
     ## Système de Reconnaissance Faciale
 
     Projet de Fin d'Études réalisé à la **Sonatel Academy** (Orange Digital Center, Dakar).
@@ -225,21 +222,23 @@ def about_page():
     ### Architecture
     | Composant | Technologie |
     |---|---|
-    | Détection | DeepFace (OpenCV backend) |
-    | Reconnaissance | ArcFace (State-of-the-art) |
+    | Détection & Reconnaissance | **{backend}** |
     | Interface | Streamlit |
     | Base de données | SQLite |
     | Auth | bcrypt |
 
+    ### Pipeline
+    - **YOLO** (priorité) — modèle entraîné sur 20 classes LFW, détection + identification en une seule passe
+    - **DeepFace / ArcFace** (fallback) — embeddings cosinus, aucun réentraînement requis pour ajouter un visage
+
     ### Fonctionnalités
     - Reconnaissance en temps réel (webcam, image, vidéo)
-    - Ajout dynamique de nouveaux visages sans réentraînement
+    - Ajout dynamique de nouveaux visages (mode fallback)
     - Authentification sécurisée (mots de passe hashés bcrypt)
     - Logs des reconnaissances par utilisateur
 
-    ### Dataset d'origine
-    Entraînement initial sur **Labeled Faces in the Wild (LFW)** —
-    13 000+ images de personnalités publiques.
+    ### Dataset d'entraînement
+    Top-20 personnes du **Labeled Faces in the Wild (LFW)** — ~1 900 images.
 
     ---
     **Développé par** Ibrahima Gabar Diop | [GitHub](https://github.com/Gblack98)
