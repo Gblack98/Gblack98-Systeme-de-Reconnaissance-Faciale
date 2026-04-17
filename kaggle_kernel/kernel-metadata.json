@@ -1,0 +1,13 @@
+{
+  "id": "ibrahimagabardiop/face-recognition-yolov8-training-lfw-top20",
+  "title": "Face Recognition YOLOv8 Training LFW Top20",
+  "code_file": "train_yolo.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["jessicali9530/lfw-dataset"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
