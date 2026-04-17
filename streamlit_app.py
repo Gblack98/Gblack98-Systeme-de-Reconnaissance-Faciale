@@ -1,6 +1,7 @@
 import os
 import cv2
 import time
+import threading
 import tempfile
 import numpy as np
 import streamlit as st
@@ -11,6 +12,9 @@ load_dotenv()
 
 from app.database import init_db, register_user, authenticate_user, log_recognition, get_recognition_logs
 from app.recognition import detect_and_recognize, draw_results, using_yolo, FACES_DB_PATH
+
+# Traiter 1 frame sur N pour le live webcam (équilibre fluidité/CPU)
+WEBCAM_PROCESS_EVERY_N = int(os.getenv("WEBCAM_PROCESS_EVERY_N", "5"))
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -136,17 +140,57 @@ def process_frame_and_display(frame, user):
             st.warning(f"❓ Inconnu — confiance insuffisante ({det['confidence']}%)")
 
 
-# ── Webcam page (st.camera_input — fonctionne partout) ───────────────────────
+# ── Webcam live (WebRTC) ──────────────────────────────────────────────────────
 def webcam_page(user):
-    st.header("📷 Reconnaissance en temps réel")
-    st.info("Prenez une photo depuis votre webcam. Le système analyse immédiatement.")
+    st.header("📷 Webcam — flux en direct")
 
-    img_file = st.camera_input("Capturer un visage")
-    if img_file:
-        file_bytes = np.frombuffer(img_file.read(), np.uint8)
-        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        with st.spinner("Analyse en cours…"):
-            process_frame_and_display(frame, user)
+    try:
+        from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+        import av
+    except ImportError:
+        st.error("streamlit-webrtc non installé. Lancer : `pip install streamlit-webrtc av`")
+        return
+
+    fps_est = "~3–8 FPS sur CPU" if not using_yolo() or True else "~15–25 FPS sur GPU"
+    st.info(
+        f"Flux webcam en direct. Le modèle analyse **1 frame sur {WEBCAM_PROCESS_EVERY_N}** "
+        f"pour rester fluide ({fps_est}). Les détections sont réaffichées sur les frames intermédiaires."
+    )
+
+    RTC_CONFIG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
+    class FaceProcessor(VideoProcessorBase):
+        def __init__(self):
+            self._frame_count = 0
+            self._last_detections = []
+            self._lock = threading.Lock()
+            self._user_id = user["id"]
+
+        def recv(self, frame: "av.VideoFrame") -> "av.VideoFrame":
+            img = frame.to_ndarray(format="bgr24")
+
+            self._frame_count += 1
+            if self._frame_count % WEBCAM_PROCESS_EVERY_N == 0:
+                detections = detect_and_recognize(img)
+                with self._lock:
+                    self._last_detections = detections
+                for det in detections:
+                    if det["verified"]:
+                        log_recognition(self._user_id, det["identity"], det["confidence"])
+            else:
+                with self._lock:
+                    detections = self._last_detections
+
+            draw_results(img, detections)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    webrtc_streamer(
+        key="face-recognition-live",
+        video_processor_factory=FaceProcessor,
+        rtc_configuration=RTC_CONFIG,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
 
 # ── Video ─────────────────────────────────────────────────────────────────────
