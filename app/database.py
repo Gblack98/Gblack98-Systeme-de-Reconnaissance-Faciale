@@ -72,3 +72,14 @@ def log_recognition(user_id: int, identity: str, confidence: float):
     )
     conn.commit()
     conn.close()
+
+
+def get_recognition_logs(user_id: int) -> list[tuple]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT identity, confidence, timestamp FROM recognition_logs "
+        "WHERE user_id = ? ORDER BY timestamp DESC LIMIT 200",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [tuple(r) for r in rows]
