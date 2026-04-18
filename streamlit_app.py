@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.database import init_db, register_user, authenticate_user, log_recognition, get_recognition_logs
-from app.recognition import detect_and_recognize, draw_results, using_yolo, FACES_DB_PATH
+from app.recognition import detect_and_recognize, draw_results, using_yolo, rebuild_face_db, FACES_DB_PATH
 
 # Traiter 1 frame sur N pour le live webcam (équilibre fluidité/CPU)
 WEBCAM_PROCESS_EVERY_N = int(os.getenv("WEBCAM_PROCESS_EVERY_N", "5"))
@@ -258,11 +258,8 @@ def add_face_page():
             dest = os.path.join(FACES_DB_PATH, f"{name}.jpg")
             img = Image.open(photo).convert("RGB")
             img.save(dest)
-            # Invalider le cache DeepFace
-            pkl_path = os.path.join(FACES_DB_PATH, "representations_arcface.pkl")
-            if os.path.exists(pkl_path):
-                os.remove(pkl_path)
-            st.success(f"✅ **{name.replace('_', ' ')}** ajouté. Il sera reconnu lors du prochain scan.")
+            rebuild_face_db()
+            st.success(f"✅ **{name.replace('_', ' ')}** ajouté. Il sera reconnu immédiatement.")
             st.image(img, width=200)
 
 

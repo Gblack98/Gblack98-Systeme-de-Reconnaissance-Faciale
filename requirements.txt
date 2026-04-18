@@ -1,4 +1,6 @@
 deepface==0.0.93
+insightface>=0.7.3
+onnxruntime>=1.16.0
 pandas>=2.0
 streamlit-webrtc>=0.47
 av>=11.0
