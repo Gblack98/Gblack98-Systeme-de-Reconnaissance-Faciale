@@ -1,14 +1,14 @@
 """
-Pipeline de reconnaissance faciale — deux étapes :
+Pipeline deux modèles :
 
-  1. Détection  : RetinaFace (généraliste, robuste sur webcam/vidéo réelle)
-  2. Reconnaissance :
-       a. ArcFace (DeepFace) — compare le crop avec data/faces/
-       b. YOLO   (optionnel) — classificateur rapide sur le crop si le modèle existe
-                               et si la confiance ArcFace est insuffisante
+  Modèle 1 — Détecteur  : face_detector.pt  (yolov8n-face, pré-entraîné WiderFace)
+               → trouve et croppe tous les visages dans le frame
 
-Avantage : le détecteur RetinaFace trouve les visages dans n'importe quel contexte.
-           ArcFace fonctionne pour toute identité dont une photo est dans data/faces/.
+  Modèle 2 — Classificateur : face_classifier.pt  (yolov8m-cls, LFW Top-20)
+               → identifie la personne sur chaque crop
+
+  Fallback  — DeepFace / ArcFace si face_classifier.pt absent
+               → embeddings cosinus sur data/faces/
 """
 
 import os
@@ -18,75 +18,100 @@ import tempfile
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
-YOLO_MODEL_PATH        = os.getenv("YOLO_MODEL_PATH", "models/face_yolo.pt")
-CONFIDENCE_THRESHOLD   = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
+DETECTOR_PATH        = os.getenv("DETECTOR_PATH",     "models/face_detector.pt")
+CLASSIFIER_PATH      = os.getenv("CLASSIFIER_PATH",   "models/face_classifier.pt")
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 
-DEEPFACE_MODEL         = os.getenv("DEEPFACE_MODEL", "ArcFace")
-DEEPFACE_DETECTOR      = os.getenv("DEEPFACE_DETECTOR", "retinaface")
-FACES_DB_PATH          = os.getenv("FACES_DB_PATH", "data/faces")
-RECOGNITION_THRESHOLD  = float(os.getenv("RECOGNITION_THRESHOLD", "0.68"))
+DEEPFACE_MODEL        = os.getenv("DEEPFACE_MODEL",    "ArcFace")
+DEEPFACE_DETECTOR     = os.getenv("DEEPFACE_DETECTOR", "retinaface")
+FACES_DB_PATH         = os.getenv("FACES_DB_PATH",     "data/faces")
+RECOGNITION_THRESHOLD = float(os.getenv("RECOGNITION_THRESHOLD", "0.68"))
 
-# ── YOLO (optionnel) ──────────────────────────────────────────────────────────
-_yolo_model = None
 
-def _load_yolo():
-    global _yolo_model
-    if Path(YOLO_MODEL_PATH).exists():
-        from ultralytics import YOLO
-        _yolo_model = YOLO(YOLO_MODEL_PATH)
-        print(f"[YOLO] Modèle chargé : {YOLO_MODEL_PATH}")
+# ── Chargement des modèles ────────────────────────────────────────────────────
+_detector    = None
+_classifier  = None
+
+
+def _load_models():
+    global _detector, _classifier
+    from ultralytics import YOLO
+
+    # Modèle 1 : détecteur de visages
+    if Path(DETECTOR_PATH).exists():
+        _detector = YOLO(DETECTOR_PATH)
+        print(f"[Détecteur]     {DETECTOR_PATH}")
     else:
-        print(f"[YOLO] Modèle absent ({YOLO_MODEL_PATH}) — YOLO désactivé.")
+        # Téléchargement automatique du pré-entraîné Ultralytics
+        _detector = YOLO("yolov8n-face.pt")
+        print("[Détecteur]     yolov8n-face.pt (pré-entraîné, téléchargé)")
 
-_load_yolo()
+    # Modèle 2 : classificateur d'identité
+    if Path(CLASSIFIER_PATH).exists():
+        _classifier = YOLO(CLASSIFIER_PATH)
+        print(f"[Classificateur] {CLASSIFIER_PATH}")
+    else:
+        _classifier = None
+        print(f"[Classificateur] absent ({CLASSIFIER_PATH}) — fallback DeepFace/ArcFace")
 
 
-def using_yolo() -> bool:
-    return _yolo_model is not None
+_load_models()
+
+
+def using_classifier() -> bool:
+    return _classifier is not None
 
 
 # ── Étape 1 : détection des visages ──────────────────────────────────────────
 
 def _detect_faces(frame: np.ndarray) -> list[dict]:
     """
-    Détecte tous les visages dans le frame avec RetinaFace.
-    Retourne une liste de { "bbox": (x, y, w, h), "crop": np.ndarray }.
+    Détecte tous les visages dans le frame.
+    Retourne [ {"bbox": (x, y, w, h), "crop": ndarray} ]
     """
-    try:
-        from deepface import DeepFace
-        faces = DeepFace.extract_faces(
-            img_path=frame,
-            detector_backend=DEEPFACE_DETECTOR,
-            enforce_detection=False,
-            align=True,
-        )
-    except Exception:
-        return []
-
-    results = []
-    for f in faces:
-        if f.get("confidence", 0) < 0.5:
-            continue
-        r = f["facial_area"]
-        x, y, w, h = r["x"], r["y"], r["w"], r["h"]
-        # Garde uniquement les crops de taille raisonnable
+    results = _detector.predict(source=frame, conf=0.4, verbose=False)[0]
+    faces = []
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        # Marge légère pour inclure le contour du visage
+        pad = 10
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(frame.shape[1], x2 + pad)
+        y2 = min(frame.shape[0], y2 + pad)
+        w, h = x2 - x1, y2 - y1
         if w < 20 or h < 20:
             continue
-        crop = frame[max(0, y):y + h, max(0, x):x + w]
-        results.append({"bbox": (x, y, w, h), "crop": crop})
-    return results
+        crop = frame[y1:y2, x1:x2]
+        faces.append({"bbox": (x1, y1, w, h), "crop": crop})
+    return faces
 
 
-# ── Étape 2a : reconnaissance ArcFace ────────────────────────────────────────
+# ── Étape 2a : classification YOLO ───────────────────────────────────────────
 
-def _recognize_arcface(crop: np.ndarray) -> dict:
+def _classify_crop(crop: np.ndarray) -> dict:
     """
-    Compare le crop avec data/faces/ via ArcFace + distance cosinus.
+    Identifie la personne sur un crop de visage via le classificateur YOLO.
+    """
+    results = _classifier.predict(source=crop, verbose=False)[0]
+    top1_idx  = int(results.probs.top1)
+    top1_conf = float(results.probs.top1conf)
+    identity  = results.names[top1_idx]
+    verified  = top1_conf >= CONFIDENCE_THRESHOLD
+    return {
+        "identity":   identity,
+        "confidence": round(top1_conf * 100, 1),
+        "verified":   verified,
+    }
+
+
+# ── Étape 2b : fallback ArcFace ───────────────────────────────────────────────
+
+def _classify_arcface(crop: np.ndarray) -> dict:
+    """
+    Fallback : compare le crop avec data/faces/ via ArcFace embeddings.
     """
     from deepface import DeepFace
-
-    if crop is None or crop.size == 0:
-        return {"identity": "Inconnu", "confidence": 0.0, "verified": False}
 
     if not os.path.exists(FACES_DB_PATH) or not any(
         f.lower().endswith((".jpg", ".jpeg", ".png"))
@@ -103,7 +128,7 @@ def _recognize_arcface(crop: np.ndarray) -> dict:
             img_path=tmp_path,
             db_path=FACES_DB_PATH,
             model_name=DEEPFACE_MODEL,
-            detector_backend="skip",   # crop déjà extrait — pas besoin de re-détecter
+            detector_backend="skip",
             distance_metric="cosine",
             enforce_detection=False,
             silent=True,
@@ -111,58 +136,30 @@ def _recognize_arcface(crop: np.ndarray) -> dict:
         os.unlink(tmp_path)
 
         if results and len(results[0]) > 0:
-            top = results[0].iloc[0]
+            top      = results[0].iloc[0]
             distance = top[f"{DEEPFACE_MODEL}_cosine"]
-            confidence = round((1 - distance) * 100, 1)
+            conf     = round((1 - distance) * 100, 1)
             identity = os.path.splitext(os.path.basename(top["identity"]))[0]
-            verified = distance < RECOGNITION_THRESHOLD
-            return {"identity": identity, "confidence": confidence, "verified": verified}
-
+            return {
+                "identity":   identity,
+                "confidence": conf,
+                "verified":   distance < RECOGNITION_THRESHOLD,
+            }
     except Exception:
         pass
 
     return {"identity": "Inconnu", "confidence": 0.0, "verified": False}
 
 
-# ── Étape 2b : classification YOLO sur crop (optionnel) ──────────────────────
-
-def _classify_yolo(crop: np.ndarray) -> dict | None:
-    """
-    Passe le crop au classificateur YOLO.
-    Retourne un résultat si confiance >= seuil, sinon None.
-    """
-    if _yolo_model is None or crop is None or crop.size == 0:
-        return None
-    try:
-        results = _yolo_model.predict(source=crop, conf=CONFIDENCE_THRESHOLD, verbose=False)[0]
-        if results.boxes:
-            box = results.boxes[0]
-            conf = float(box.conf[0])
-            cls_id = int(box.cls[0])
-            identity = results.names[cls_id]
-            return {"identity": identity, "confidence": round(conf * 100, 1), "verified": True}
-    except Exception:
-        pass
-    return None
-
-
 # ── Interface publique ────────────────────────────────────────────────────────
 
 def detect_and_recognize(frame: np.ndarray) -> list[dict]:
     """
-    Détecte et identifie tous les visages dans une frame BGR.
+    Pipeline complet :
+      1. Détecte les visages (yolov8n-face)
+      2. Classifie chaque crop (classificateur YOLO si dispo, sinon ArcFace)
 
-    Pipeline :
-      RetinaFace (détection) → ArcFace (reconnaissance)
-                             → YOLO en complément si confiance ArcFace < seuil
-
-    Retourne une liste de :
-        {
-            "bbox"      : (x, y, w, h),
-            "identity"  : str,
-            "confidence": float,   # 0–100
-            "verified"  : bool,
-        }
+    Retourne : [ {"bbox": (x,y,w,h), "identity": str, "confidence": float, "verified": bool} ]
     """
     faces = _detect_faces(frame)
     if not faces:
@@ -171,13 +168,10 @@ def detect_and_recognize(frame: np.ndarray) -> list[dict]:
     detections = []
     for face in faces:
         crop = face["crop"]
-
-        # Essayer YOLO en premier (rapide) si disponible
-        result = _classify_yolo(crop)
-
-        # Sinon (ou si confiance insuffisante) → ArcFace
-        if result is None:
-            result = _recognize_arcface(crop)
+        if _classifier is not None:
+            result = _classify_crop(crop)
+        else:
+            result = _classify_arcface(crop)
 
         detections.append({
             "bbox":       face["bbox"],
@@ -190,24 +184,22 @@ def detect_and_recognize(frame: np.ndarray) -> list[dict]:
 
 
 def draw_results(frame: np.ndarray, detections: list[dict]) -> np.ndarray:
-    """Dessine les bounding boxes et labels sur la frame."""
     for det in detections:
         x, y, w, h = det["bbox"]
-        verified = det["verified"]
-        color = (0, 200, 0) if verified else (0, 100, 220)
-
+        color = (0, 200, 0) if det["verified"] else (0, 100, 220)
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
         label = det["identity"].replace("_", " ")
-        if verified:
+        if det["verified"]:
             label += f"  {det['confidence']}%"
 
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (x, y - th - 10), (x + tw + 4, y), color, -1)
-        cv2.putText(
-            frame, label,
-            (x + 2, y - 4),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
-        )
-
+        cv2.putText(frame, label, (x + 2, y - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return frame
+
+
+# Alias conservé pour rétrocompatibilité avec l'UI
+def using_yolo() -> bool:
+    return using_classifier()
