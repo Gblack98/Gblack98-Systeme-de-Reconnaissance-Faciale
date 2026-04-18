@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![mAP@50](https://img.shields.io/badge/mAP%4050-97.15%25-brightgreen)](#résultats)
 
-Pipeline de reconnaissance faciale en temps réel combinant **YOLOv8** (détection + classification en une passe) et **DeepFace/ArcFace** en fallback. Entraîné sur les 20 personnes les plus représentées du dataset LFW — **97,15 % de mAP@50** en 96 époques (~9 min sur Tesla T4).
+Pipeline de reconnaissance faciale en temps réel basé sur **InsightFace buffalo_l** — RetinaFace pour la détection, ArcFace ResNet50 pour la reconnaissance par embeddings. Aucun entraînement requis, open-set : fonctionne pour toute personne dont une photo est disponible.
 
 ---
 
@@ -19,34 +19,29 @@ Pipeline de reconnaissance faciale en temps réel combinant **YOLOv8** (détecti
 Entrée (webcam / image / vidéo)
         │
         ▼
-┌───────────────────┐
-│   YOLOv8 26m      │  ← pipeline principal
-│  détection +      │
-│  classification   │
-│  en 1 passe       │
-└────────┬──────────┘
-         │ confiance ≥ seuil → identité (20 classes)
-         │ confiance < seuil
-         ▼
-┌───────────────────┐
-│  DeepFace/ArcFace │  ← fallback nouvelles identités
-└────────┬──────────┘
-         ▼
+┌─────────────────────────────┐
+│  InsightFace buffalo_l      │
+│                             │
+│  1. RetinaFace              │  ← détecte + aligne les visages
+│     (det_10g.onnx)          │
+│  2. ArcFace ResNet50        │  ← embedding 512-dim par visage
+│     (w600k_r50.onnx)        │
+└────────────┬────────────────┘
+             │  similarité cosinus vs data/faces/
+             ▼
 ┌────────────────────────┐
 │  Streamlit + SQLite    │
 │  (auth bcrypt + logs)  │
 └────────────────────────┘
 ```
 
-## Résultats
+## Pourquoi InsightFace
 
-| Approche | Précision | Durée |
+| Approche | Précision | Limites |
 |---|---|---|
-| CNN from scratch | 33 % | ~30 min |
-| ResNet-50 Transfer Learning | 35 % | ~45 min |
-| ResNet-50 Fine-tuning | 40 % | ~1 h |
-| ResNet-50 Fine-tuning optimisé | 53 % | ~2 h 30 |
-| **YOLOv8 26m (final)** | **97,15 % mAP@50** | **~9 min** |
+| CNN / ResNet classifieur | 33–53 % | Classes fixes, réentraînement requis |
+| YOLOv8 classificateur | ~97 % sur LFW | Ne généralise pas au flux réel |
+| **InsightFace ArcFace** | **99,77 % (LFW benchmark)** | **Open-set, zéro réentraînement** |
 
 ## Démarrage rapide
 
@@ -58,8 +53,8 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 
-# Télécharger face_yolo.pt depuis les releases et le placer dans models/
 streamlit run streamlit_app.py
+# InsightFace buffalo_l (~300 MB) se télécharge automatiquement au 1er démarrage
 ```
 
 Documentation complète : [`docs/face-recognition-system.md`](docs/face-recognition-system.md)

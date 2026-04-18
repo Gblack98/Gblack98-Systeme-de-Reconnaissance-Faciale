@@ -10,32 +10,32 @@
 1. [Présentation](#1-présentation)
 2. [Architecture](#2-architecture)
 3. [Dataset](#3-dataset)
-4. [Entraînement](#4-entraînement)
-5. [Résultats](#5-résultats)
-6. [Installation](#6-installation)
-7. [Configuration](#7-configuration)
-8. [Utilisation](#8-utilisation)
-9. [API interne](#9-api-interne)
-10. [Éthique & sécurité](#10-éthique--sécurité)
-11. [Licence](#11-licence)
+4. [Résultats des approches](#4-résultats-des-approches)
+5. [Installation](#5-installation)
+6. [Configuration](#6-configuration)
+7. [Utilisation](#7-utilisation)
+8. [API interne](#8-api-interne)
+9. [Éthique & sécurité](#9-éthique--sécurité)
+10. [Licence](#10-licence)
 
 ---
 
 ## 1. Présentation
 
-Pipeline de reconnaissance faciale en temps réel combinant **YOLOv8** (détection + classification en une seule passe) et **DeepFace/ArcFace** en fallback pour les identités hors des 20 classes entraînées.
+Système de reconnaissance faciale en temps réel basé sur **InsightFace buffalo_l** — pipeline deux étapes combinant RetinaFace (détection) et ArcFace ResNet50 (reconnaissance par embeddings). Aucun entraînement requis : le système reconnaît toute personne dont une photo de référence est disponible.
 
-### Approches comparées
+### Évolution des approches
 
-| Approche | Précision val. | Entraînement |
+| Approche | Précision | Limites |
 |---|---|---|
-| CNN from scratch | 33 % | ~30 min |
-| ResNet-50 Transfer Learning | 35 % | ~45 min |
-| ResNet-50 Fine-tuning | 40 % | ~1 h |
-| ResNet-50 Fine-tuning optimisé | 53 % | ~2 h 30 |
-| **YOLOv8 26m (final)** | **97,15 % mAP@50** | **~9 min** |
+| CNN from scratch | 33 % | Pas de généralisation |
+| ResNet-50 Transfer Learning | 35 % | Idem |
+| ResNet-50 Fine-tuning | 40 % | Lent, limité aux classes entraînées |
+| ResNet-50 Fine-tuning optimisé | 53 % | 2 h 30, toujours limité |
+| YOLOv8 (détection + classification 1 passe) | ~97 % sur LFW | Ne fonctionne pas sur flux réel |
+| **InsightFace buffalo_l (final)** | **État de l'art** | **Open-set, zéro réentraînement** |
 
-Le choix de YOLO comme classificateur (et non seulement détecteur) s'est révélé décisif : en traitant chaque crop de visage comme une classe d'objet distincte, le modèle bénéficie de l'architecture NMS-free et des têtes de classification optimisées d'Ultralytics.
+Le passage à InsightFace a été décisif : les approches précédentes entraînaient un classificateur fermé (N classes fixes). InsightFace utilise des **embeddings** — la reconnaissance fonctionne pour n'importe qui, il suffit d'une photo de référence.
 
 ---
 
@@ -45,46 +45,49 @@ Le choix de YOLO comme classificateur (et non seulement détecteur) s'est révé
 Entrée (webcam / image / vidéo)
         │
         ▼
-┌───────────────────┐
-│   YOLOv8 26m      │  ← pipeline principal (modèle présent)
-│  détection +      │
-│  classification   │
-│  en 1 passe       │
-└────────┬──────────┘
-         │ confiance ≥ seuil → identité YOLO (20 classes)
-         │ confiance < seuil
-         ▼
-┌───────────────────┐
-│  DeepFace/ArcFace │  ← fallback (nouvelles identités)
-│  embeddings       │
-│  cosinus dist.    │
-└────────┬──────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│  Streamlit UI               │
-│  + SQLite (logs + auth)     │
-└─────────────────────────────┘
+┌──────────────────────────────────┐
+│  InsightFace buffalo_l           │
+│                                  │
+│  Étape 1 — RetinaFace            │
+│  (det_10g.onnx)                  │
+│  → détecte tous les visages      │
+│  → bounding boxes + landmarks    │
+│  → crop + alignement             │
+└────────────────┬─────────────────┘
+                 │  crops alignés
+                 ▼
+┌──────────────────────────────────┐
+│  Étape 2 — ArcFace ResNet50      │
+│  (w600k_r50.onnx)                │
+│  → embedding 512 dimensions      │
+│  → similarité cosinus vs base    │
+│  → identité + score              │
+└────────────────┬─────────────────┘
+                 │
+                 ▼
+┌──────────────────────────────────┐
+│  Streamlit UI                    │
+│  + SQLite (auth bcrypt + logs)   │
+└──────────────────────────────────┘
 ```
 
 ### Composants
 
 | Couche | Technologie | Rôle |
 |---|---|---|
-| Présentation | Streamlit | UI webcam / image / vidéo, auth |
-| Reconnaissance | YOLOv8 26m | Détection + identification en 1 passe |
-| Fallback | DeepFace ArcFace | Identités non entraînées |
+| Détection | RetinaFace (InsightFace) | Localisation + alignement des visages |
+| Reconnaissance | ArcFace ResNet50 (InsightFace) | Embeddings 512-dim + similarité cosinus |
+| Base de référence | Fichiers JPG dans `data/faces/` | 1 photo minimum par identité |
+| Cache embeddings | `data/faces/embeddings.pkl` | Recalculé si `data/faces/` change |
+| Présentation | Streamlit + WebRTC | UI webcam live / image / vidéo |
 | Persistance | SQLite + bcrypt | Utilisateurs, logs de reconnaissance |
 
-### Sélection du backend (`app/recognition.py`)
+### Pourquoi InsightFace buffalo_l
 
-```python
-def using_yolo() -> bool:
-    path = os.getenv("YOLO_MODEL_PATH", "models/face_yolo.pt")
-    return os.path.exists(path)
-```
-
-Si `face_yolo.pt` est absent, le système bascule automatiquement sur DeepFace — aucune modification de code requise.
+- **RetinaFace** : détecteur multi-échelle entraîné sur WiderFace (32k images), robuste aux occlusions, angles et faible éclairage
+- **ArcFace** : perte angulaire qui maximise la séparabilité inter-classe — 99,77 % sur LFW benchmark
+- **Open-set** : pas de réentraînement pour ajouter une nouvelle identité
+- **Modèles ONNX** : inférence CPU/GPU sans dépendance PyTorch
 
 ---
 
@@ -92,9 +95,9 @@ Si `face_yolo.pt` est absent, le système bascule automatiquement sur DeepFace �
 
 **Source** : [Labeled Faces in the Wild (LFW)](https://www.kaggle.com/datasets/jessicali9530/lfw-dataset)
 
-### Sélection des classes
+Utilisé pour construire la base de référence (embeddings des 20 personnes les plus représentées).
 
-Seules les personnes disposant d'**au moins 30 images** ont été retenues, ce qui donne 20 classes (« Top-20 ») :
+### LFW Top-20
 
 | # | Identité | Images |
 |---|---|---|
@@ -121,263 +124,184 @@ Seules les personnes disposant d'**au moins 30 images** ont été retenues, ce q
 
 **Total** : ~1 900 images
 
-### Splits
+### Génération de la base de référence (Kaggle)
 
-| Split | Ratio | Usage |
+Le notebook `kaggle_kernel/train_yolo.ipynb` :
+1. Charge les images LFW Top-20
+2. Génère un embedding ArcFace moyen par personne (moyenne de 5 images)
+3. Exporte `face_embeddings.npz` + une image de référence par personne
+4. Ces fichiers se déposent dans `data/faces/` — reconnaissance immédiate au démarrage
+
+---
+
+## 4. Résultats des approches
+
+### Benchmark ArcFace (LFW officiel)
+
+| Modèle | LFW Accuracy |
+|---|---|
+| VGG-Face | 98,95 % |
+| FaceNet | 99,63 % |
+| **ArcFace ResNet50** | **99,77 %** |
+| AdaFace R100 | 99,82 % |
+
+### Performances système (CPU local)
+
+| Source | FPS estimé | Latence par frame |
 |---|---|---|
-| Train | 70 % | Mise à jour des poids |
-| Validation | 15 % | Monitoring pendant l'entraînement |
-| Test | 15 % | Évaluation finale |
-
-Les splits sont stratifiés par classe. Format de sortie : YOLO (`.txt` avec coordonnées normalisées, bounding box = image entière).
+| Image (upload) | — | ~200–500 ms |
+| Vidéo | ~3–5 FPS | ~200–300 ms |
+| Webcam live (1/5 frames) | Flux 30 FPS | ~200 ms par analyse |
 
 ---
 
-## 4. Entraînement
-
-### Modèle : YOLO26m
-
-| Paramètre | Valeur |
-|---|---|
-| Architecture | YOLOv8 26m (medium) |
-| Paramètres | 21,8 M |
-| GFLOPs | 74,9 |
-| Framework | Ultralytics 8.4.37 |
-| Accélérateur | Tesla T4 (Kaggle) |
-
-### Configuration (`kaggle_kernel/train_yolo.ipynb`)
-
-```python
-model = YOLO("yolo11m.pt")          # poids pré-entraînés COCO
-model.train(
-    data   = "dataset.yaml",
-    epochs = 100,
-    imgsz  = 224,
-    batch  = 64,
-    lr0    = 0.001,
-    lrf    = 0.01,
-    patience = 20,                  # early stopping
-    project  = "face_recognition",
-    name     = "yolo26m_lfw_top20",
-)
-```
-
-### Résumé de l'entraînement
-
-- **Époques effectives** : 96 / 100 (early stopping à l'époque 76)
-- **Durée** : ~9 min sur Tesla T4
-- **Best checkpoint** : époque 76
-- **Loss finale** : box=0.31, cls=0.28, dfl=0.89
-
----
-
-## 5. Résultats
-
-### Métriques globales
-
-| Métrique | Valeur |
-|---|---|
-| **mAP@50** | **97,15 %** |
-| mAP@50-95 | 96,94 % |
-| Précision | 87,72 % |
-| Rappel | 94,41 % |
-
-### Métriques par classe (mAP@50)
-
-| Classe | mAP@50 |
-|---|---|
-| George W Bush | 99,5 % |
-| Colin Powell | 98,2 % |
-| Tony Blair | 97,8 % |
-| Donald Rumsfeld | 97,1 % |
-| Serena Williams | 96,9 % |
-| Vladimir Putin | 96,4 % |
-| Winona Ryder | 95,8 % |
-| Jennifer Capriati | 94,7 % |
-| … (20 classes) | ≥ 94 % |
-
-### Interprétation
-
-Le déséquilibre de classes (530 images pour Bush vs 30 pour Capriati) n'a pas dégradé significativement les performances sur les classes minoritaires, grâce à l'augmentation de données appliquée par Ultralytics (mosaic, flips, HSV jitter).
-
----
-
-## 6. Installation
+## 5. Installation
 
 ### Prérequis
 
 - Python 3.10+
-- pip
-- (Optionnel) GPU CUDA pour l'inférence temps réel
+- (Recommandé) GPU CUDA pour l'inférence temps réel
 
 ### Étapes
 
 ```bash
-# Cloner le repo
 git clone https://github.com/Gblack98/Gblack98-Systeme-de-Reconnaissance-Faciale.git
 cd Gblack98-Systeme-de-Reconnaissance-Faciale
 
-# Environnement virtuel
 python -m venv .venv
 source .venv/bin/activate        # Windows : .venv\Scripts\activate
-
-# Dépendances
 pip install -r requirements.txt
 
-# Modèle YOLO
-# Télécharger face_yolo.pt depuis les releases GitHub et le placer dans models/
-mkdir -p models
-# → déposer face_yolo.pt dans models/
+cp .env.example .env
+```
 
-# Configuration
-cp .env.example .env             # ajuster si besoin
+Au premier démarrage, InsightFace télécharge automatiquement les modèles buffalo_l (~300 MB).
 
-# Lancer
+```bash
 streamlit run streamlit_app.py
 ```
 
-L'application est accessible sur `http://localhost:8501`.
+### Ajouter les identités LFW (optionnel)
+
+Lancer `kaggle_kernel/train_yolo.ipynb` sur Kaggle, puis déposer les fichiers générés :
+
+```
+data/faces/George_W_Bush.jpg
+data/faces/Colin_Powell.jpg
+...  (20 images de référence)
+```
+
+Le cache d'embeddings (`embeddings.pkl`) se reconstruit automatiquement.
 
 ### Dépendances principales
 
 ```
-ultralytics>=8.4.37
-deepface>=0.0.93
+insightface>=0.7.3
+onnxruntime>=1.16.0
 streamlit>=1.35
+streamlit-webrtc>=0.47
 opencv-python-headless>=4.9
 bcrypt>=4.1
 python-dotenv>=1.0
-Pillow>=10.0
-numpy>=1.26
+pandas>=2.0
 ```
 
 ---
 
-## 7. Configuration
+## 6. Configuration
 
-Toutes les options sont dans le fichier `.env` (copier depuis `.env.example`) :
+Fichier `.env` (copier depuis `.env.example`) :
 
 | Variable | Défaut | Description |
 |---|---|---|
 | `DB_PATH` | `data/users.db` | Base SQLite utilisateurs + logs |
-| `YOLO_MODEL_PATH` | `models/face_yolo.pt` | Chemin vers le modèle entraîné |
-| `CONFIDENCE_THRESHOLD` | `0.5` | Seuil de confiance YOLO (0–1) |
-| `FACES_DB_PATH` | `data/faces` | Dossier images de référence DeepFace |
-| `DEEPFACE_MODEL` | `ArcFace` | Modèle DeepFace (`ArcFace`, `Facenet512`…) |
-| `DEEPFACE_DETECTOR` | `opencv` | Détecteur DeepFace (`opencv`, `retinaface`…) |
-| `RECOGNITION_THRESHOLD` | `0.68` | Seuil distance cosinus DeepFace |
+| `FACES_DB_PATH` | `data/faces` | Dossier des images de référence |
+| `RECOGNITION_THRESHOLD` | `0.45` | Seuil similarité cosinus ArcFace (0–1) |
+| `WEBCAM_PROCESS_EVERY_N` | `5` | Analyser 1 frame sur N (webcam live) |
 
-**Régler `CONFIDENCE_THRESHOLD`** :
-- `0.7+` → moins de faux positifs, peut manquer des visages flous
-- `0.4–0.5` → meilleur rappel, accepte plus d'ambiguïté
+**Régler `RECOGNITION_THRESHOLD`** :
+- `0.55+` → strict, peu de faux positifs
+- `0.45` → bon équilibre (défaut)
+- `0.35` → permissif, meilleur rappel
 
 ---
 
-## 8. Utilisation
+## 7. Utilisation
 
 ### Interface Streamlit
 
-L'application propose trois modes depuis la sidebar :
+**Reconnaissance (`🔍`)** — image ou vidéo uploadée  
+**Webcam (`📷`)** — flux live via WebRTC, analyse toutes les N frames  
+**Ajouter un visage (`➕`)** — déposer une photo, embeddings recalculés immédiatement  
+**Historique (`📋`)** — 200 dernières reconnaissances de l'utilisateur connecté  
 
-**Reconnaissance (`🔍`)** — trois sources :
-- `📷 Webcam` — flux temps réel, s'ouvre dans une fenêtre OpenCV (`Q` pour quitter)
-- `🖼️ Image` — upload JPEG/PNG, affichage annoté immédiat
-- `🎬 Vidéo` — upload MP4/MOV/AVI, lecture frame par frame avec bouton stop
+### Ajouter une identité
 
-**Ajouter un visage (`➕`)** — pour le mode DeepFace uniquement :
-1. Saisir le nom (format `Prénom_Nom`)
-2. Uploader une photo claire
-3. Le cache DeepFace est invalidé automatiquement pour forcer le recalcul des embeddings
-
-**À propos (`ℹ️`)** — affiche le backend actif et les infos du projet.
-
-### Ajouter une identité YOLO
-
-Le modèle YOLO ne supporte que les 20 classes entraînées. Pour ajouter une nouvelle personne au pipeline YOLO :
-1. Collecter ≥ 30 images de la personne
-2. Relancer l'entraînement dans `kaggle_kernel/train_yolo.ipynb` avec la nouvelle classe
-3. Remplacer `models/face_yolo.pt`
-
-Pour une extension sans réentraînement, utiliser le fallback DeepFace via `➕ Ajouter un visage`.
+1. Aller dans `➕ Ajouter un visage`
+2. Saisir le nom (format `Prénom_Nom`)
+3. Uploader une photo claire, face visible
+4. Reconnaissance active immédiatement — pas de redémarrage requis
 
 ---
 
-## 9. API interne
+## 8. API interne
 
 ### `app/recognition.py`
 
 ```python
 def detect_and_recognize(frame: np.ndarray) -> list[dict]:
     """
-    Détecte et identifie tous les visages dans une image BGR.
-
-    Retourne une liste de dicts :
-    {
-        "bbox"      : [x1, y1, x2, y2],
-        "identity"  : str,        # nom ou "Inconnu"
-        "confidence": float,      # 0–100
-        "verified"  : bool
-    }
+    Pipeline complet : RetinaFace détection + ArcFace reconnaissance.
+    Retourne :
+        [ {"bbox": (x, y, w, h), "identity": str,
+           "confidence": float,  "verified": bool} ]
     """
 
 def draw_results(frame: np.ndarray, detections: list[dict]) -> np.ndarray:
-    """Dessine les bounding boxes et labels sur le frame BGR."""
+    """Annote le frame avec bounding boxes et labels."""
 
-def using_yolo() -> bool:
-    """Retourne True si le modèle YOLO est disponible."""
+def rebuild_face_db() -> None:
+    """Invalide le cache et reconstruit la base d'embeddings."""
 ```
 
 ### `app/database.py`
 
 ```python
-def init_db() -> None:
-    """Crée les tables SQLite si elles n'existent pas."""
-
-def register_user(first_name, last_name, username, password) -> bool:
-    """Enregistre un utilisateur (mot de passe hashé bcrypt). False si username pris."""
-
-def authenticate_user(username, password) -> dict | None:
-    """Retourne le dict utilisateur si les identifiants sont corrects, sinon None."""
-
-def log_recognition(user_id: int, identity: str, confidence: float) -> None:
-    """Enregistre un événement de reconnaissance dans les logs."""
+def init_db() -> None
+def register_user(first_name, last_name, username, password) -> bool
+def authenticate_user(username, password) -> dict | None
+def log_recognition(user_id: int, identity: str, confidence: float) -> None
+def get_recognition_logs(user_id: int) -> list[tuple]
 ```
 
 ---
 
-## 10. Éthique & sécurité
+## 9. Éthique & sécurité
 
-### Limitations du système
+### Limitations
 
-- **20 identités fixes** (pipeline YOLO) — toute personne hors de ces 20 classes retourne "Inconnu"
-- **Dataset biaisé** — LFW surreprésente les hommes politiques occidentaux de 2002–2004
-- **Conditions** — performances dégradées par occultation, faible éclairage, angles extrêmes
+- **Dataset biaisé** — LFW surreprésente les hommes politiques occidentaux (2002–2004)
+- **Conditions dégradées** — occultation, profil, très faible éclairage réduisent les performances
+- **Open-set** — toute personne sans photo de référence retourne "Inconnu"
 
 ### Usage responsable
 
-Ce système est développé à des **fins académiques**. Tout déploiement en production implique :
-
-- Le respect du **RGPD** (ou réglementation locale équivalente)
-- Le **consentement explicite** des personnes identifiées
-- L'**interdiction d'usage discriminatoire** (surveillance de masse, profilage, contrôle d'accès sans consentement)
+Système développé à des **fins académiques**. Tout déploiement en production requiert :
+- Respect du **RGPD** (ou législation locale sur la biométrie)
+- **Consentement explicite** des personnes identifiées
+- Interdiction d'usage discriminatoire
 
 ### Sécurité du code
 
-- Mots de passe hashés avec **bcrypt** (coût 12)
-- Aucune clé ou credential dans le code source (variables d'environnement via `.env`)
-- `face_yolo.pt` et `data/users.db` exclus du versioning (`.gitignore`)
+- Mots de passe hashés **bcrypt**
+- Aucun credential dans le code — variables d'environnement via `.env`
+- `data/users.db` et `data/faces/` exclus du versioning
 
 ---
 
-## 11. Licence
+## 10. Licence
 
 MIT License — Copyright (c) 2024 Ibrahima Gabar Diop
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
 
 ---
 
