@@ -1,6 +1,6 @@
 {
   "id": "ibrahimagabardiop/face-recognition-yolov8-training-lfw-top20",
-  "title": "Face Recognition YOLOv8 Training LFW Top20",
+  "title": "Face Recognition — InsightFace Embeddings LFW Top-20",
   "code_file": "train_yolo.ipynb",
   "language": "python",
   "kernel_type": "notebook",
